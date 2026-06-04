@@ -1,6 +1,6 @@
 # Shortly — url-shortener
 
-[![CI](https://github.com/josh/url-shortener/actions/workflows/ci.yml/badge.svg)](https://github.com/josh/url-shortener/actions)
+[![CI](https://github.com/JCreatesGH/url-shortener/actions/workflows/ci.yml/badge.svg)](https://github.com/JCreatesGH/url-shortener/actions)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
