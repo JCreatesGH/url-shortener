@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+.scrape_cache/
+*.db
+.env
+.DS_Store
+*.egg-info/
+.venv/
