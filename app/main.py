@@ -13,10 +13,15 @@ from .shortcode import encode
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$", re.IGNORECASE)
+ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# aliases that would collide with a real route and be unreachable
+RESERVED = {"api", "static", "docs", "redoc", "openapi.json", "favicon.ico"}
 
 
 class ShortenIn(BaseModel):
     url: str
+    alias: Optional[str] = None
+
     @field_validator("url")
     @classmethod
     def valid(cls, v: str) -> str:
@@ -48,26 +53,58 @@ def _db(path: str) -> sqlite3.Connection:
             referrer TEXT
         );
     """)
+    # additive migration for existing databases
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(links)")}
+    if "custom" not in cols:
+        conn.execute("ALTER TABLE links ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
 
 def create_app(db_path: str = "urls.db") -> FastAPI:
     conn = _db(db_path)
-    app = FastAPI(title="URL Shortener", version="1.0.0")
+    app = FastAPI(title="URL Shortener", version="1.1.0")
 
     def now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    def _taken(code: str, exclude_id: Optional[int] = None) -> bool:
+        if exclude_id is None:
+            return conn.execute("SELECT 1 FROM links WHERE code = ?", (code,)).fetchone() is not None
+        return conn.execute("SELECT 1 FROM links WHERE code = ? AND id != ?",
+                            (code, exclude_id)).fetchone() is not None
+
     @app.post("/api/shorten", response_model=ShortenOut)
     def shorten(body: ShortenIn, request: Request):
-        cur = conn.execute("INSERT INTO links (target, created) VALUES (?, ?)",
-                           (body.url, now()))
+        base = str(request.base_url).rstrip("/")
+
+        if body.alias is not None:
+            alias = body.alias
+            if not ALIAS_RE.match(alias) or alias.lower() in RESERVED:
+                raise HTTPException(400, "alias must be 1-32 chars of [A-Za-z0-9_-] and not reserved")
+            if _taken(alias):
+                raise HTTPException(409, "alias already taken")
+            conn.execute("INSERT INTO links (target, code, custom, created) VALUES (?, ?, 1, ?)",
+                         (body.url, alias, now()))
+            conn.commit()
+            return {"code": alias, "short_url": f"{base}/{alias}", "target": body.url}
+
+        # idempotent: reuse the existing auto code for an identical target
+        existing = conn.execute(
+            "SELECT code FROM links WHERE target = ? AND custom = 0 AND code IS NOT NULL ORDER BY id LIMIT 1",
+            (body.url,)).fetchone()
+        if existing:
+            return {"code": existing["code"], "short_url": f"{base}/{existing['code']}", "target": body.url}
+
+        cur = conn.execute("INSERT INTO links (target, created) VALUES (?, ?)", (body.url, now()))
         link_id = cur.lastrowid
+        bump = 0
         code = encode(link_id + 1000)  # offset so codes aren't trivially 1,2,3
+        while _taken(code, exclude_id=link_id):   # avoid colliding with a custom alias
+            bump += 1
+            code = encode(link_id + 1000 + bump)
         conn.execute("UPDATE links SET code = ? WHERE id = ?", (code, link_id))
         conn.commit()
-        base = str(request.base_url).rstrip("/")
         return {"code": code, "short_url": f"{base}/{code}", "target": body.url}
 
     @app.get("/api/stats/{code}")
@@ -80,8 +117,13 @@ def create_app(db_path: str = "urls.db") -> FastAPI:
         by_day = conn.execute(
             "SELECT substr(ts,1,10) d, COUNT(*) c FROM clicks WHERE link_id = ? GROUP BY d ORDER BY d",
             (link["id"],)).fetchall()
+        refs = conn.execute(
+            "SELECT COALESCE(NULLIF(referrer,''),'(direct)') r, COUNT(*) c FROM clicks "
+            "WHERE link_id = ? GROUP BY r ORDER BY c DESC, r LIMIT 5",
+            (link["id"],)).fetchall()
         return {"code": code, "target": link["target"], "clicks": total,
-                "by_day": [{"date": r["d"], "clicks": r["c"]} for r in by_day]}
+                "by_day": [{"date": r["d"], "clicks": r["c"]} for r in by_day],
+                "top_referrers": [{"referrer": r["r"], "clicks": r["c"]} for r in refs]}
 
     @app.get("/api/links")
     def links():
